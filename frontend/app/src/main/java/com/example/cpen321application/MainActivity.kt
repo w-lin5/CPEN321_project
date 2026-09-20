@@ -2,15 +2,22 @@ package com.example.cpen321application
 
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
@@ -18,14 +25,19 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
@@ -34,6 +46,8 @@ import androidx.credentials.GetCredentialRequest
 import com.example.cpen321application.ui.theme.CPEN321ApplicationTheme
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import io.socket.client.IO
+import io.socket.client.Socket
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlinx.coroutines.Dispatchers
@@ -46,7 +60,6 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.time.ZonedDateTime
 import java.util.Collections
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 private enum class Screen { HOME, LOGIN, LIVE, TIMER }
@@ -121,12 +134,6 @@ fun HomeScreen(
 
 /** HELPERS */
 private val httpClient = OkHttpClient()
-
-// WebSocket client: no read timeout, OkHttp pings keep the connection alive
-private val wsClient = httpClient.newBuilder()
-    .readTimeout(0, TimeUnit.MILLISECONDS)
-    .pingInterval(30, TimeUnit.SECONDS)
-    .build()
 
 /** hh:mm:ss GMT+hh:mm (24-hour format, device timezone) */
 private fun getClientTime(): String {
@@ -240,9 +247,98 @@ private suspend fun signInAndLoadInfo(context: Context): String {
 
 //* LIVE Updates */
 private const val GRID = 16
+private const val NEW_IMAGE_GAP_MS = 5000L
+private val BLANK_CELL = Color.White
+
+private data class Pixel(val x: Int, val y: Int, val color: Color)
+
+/** Parses {"x":<int>,"y":<int>,"color":"<hex>"} into custom Pixel class
+ *  Returns null if malformed or out of range */
+private fun parsePixel(message: String): Pixel? = try {
+    val json = JSONObject(message)
+    val x = json.getInt("x")
+    val y = json.getInt("y")
+    // Makes sure hex values are in standardized form, with # in front
+    val hex = json.getString("color")
+        .let{ if (it.startsWith("#")) it else "#$it" }
+    // Validates coordinates
+    if (x in 0 until GRID && y in 0 until GRID) {
+        Pixel(x, y, Color(android.graphics.Color.parseColor(hex)))
+    } else null
+} catch (e: Exception) {
+    null
+}
+
 @Composable
 fun LiveScreen() {
-    return // TODO: complete
+    val grid = remember {
+        mutableStateListOf<Color>().apply{ repeat(GRID * GRID){ add(BLANK_CELL) } }
+    }
+    var status by remember { mutableStateOf("Connecting...") }
+
+    // Starts when the screen opens; leaving the screen disposes it and closes the socket
+    DisposableEffect(Unit) {
+        val main = Handler(Looper.getMainLooper())
+        var lastPixelAt = 0L
+
+        val options = IO.Options().apply{ transports = arrayOf("websocket") } // no polling
+        val socket = IO.socket(BuildConfig.API_BASE_URL.trimEnd('/'), options)
+
+        // Fires on the first connect and on every automatic reconnect
+        socket.on(Socket.EVENT_CONNECT) {
+            main.post {
+                for (i in grid.indices) grid[i] = BLANK_CELL
+                lastPixelAt = 0L
+                status = "Pixel Art:"
+            }
+        }
+        socket.on(Socket.EVENT_DISCONNECT) {
+            main.post { status = "Disconnected. Reconnecting..." }
+        }
+        socket.on("pixel") { args ->
+            val message = args.firstOrNull() as? String ?: return@on
+            main.post {
+                val pixel = parsePixel(message) ?: return@post
+
+                // A long silence means the previous image finished: a new one is starting
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastPixelAt > NEW_IMAGE_GAP_MS) {
+                    for (i in grid.indices) grid[i] = BLANK_CELL
+                }
+                lastPixelAt = now
+
+                grid[pixel.y * GRID + pixel.x] = pixel.color
+            }
+        }
+        socket.connect()
+
+        onDispose {
+            socket.off()
+            socket.disconnect()
+        }
+    }
+
+    // The visual grid and filling in grid rectangles as stream comes through
+    Column(
+        modifier = Modifier.fillMaxSize().padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(status)
+        Spacer(Modifier.height(16.dp))
+        Canvas(Modifier.fillMaxWidth().aspectRatio(1f).border(1.dp, Color.Black)) {
+            val cell = size.width / GRID
+            for (y in 0 until GRID) {
+                for (x in 0 until GRID) {
+                    drawRect(
+                        color = grid[y * GRID + x],
+                        topLeft = Offset(x * cell, y * cell),
+                        size = Size(cell, cell)
+                    )
+                }
+            }
+        }
+    }
 }
 
 

@@ -1,5 +1,8 @@
 import express, { type Express, Router } from 'express';
 
+import type { Server as HttpServer } from 'http';
+import { Server as IoServer } from 'socket.io';
+
 const COURSE_WS_URL = 'wss://8.229.22.124'
 
 // TODO: Change this
@@ -58,4 +61,24 @@ export function createApp(): Express {
   });
 
   return app;
+}
+
+// Live pixel pass through (course WS -> Socket.io server -> Android app)
+// Each connected app gets its own upstream connection, so its picture starts blank
+export function attachLiveRelay(server: HttpServer): IoServer {
+  const io = new IoServer(server);
+ 
+  io.on('connection', (client) => {
+    const upstream = new WebSocket(COURSE_WS_URL); // Node 22 global WebSocket
+ 
+    // Relay every pixel immediately, payload untouched
+    upstream.addEventListener('message', (event) => {
+      client.emit('pixel', event.data);
+    });
+    upstream.addEventListener('error', () => console.error('Course WebSocket error'));
+ 
+    client.on('disconnect', () => upstream.close());
+  });
+ 
+  return io;
 }
