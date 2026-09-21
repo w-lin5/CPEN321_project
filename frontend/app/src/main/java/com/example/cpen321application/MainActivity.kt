@@ -10,6 +10,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,7 +21,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,12 +39,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
 import androidx.credentials.CustomCredential
@@ -50,7 +58,11 @@ import io.socket.client.IO
 import io.socket.client.Socket
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -343,9 +355,185 @@ fun LiveScreen() {
 
 
 //* TIMER */
+private enum class TimerPhase { IDLE, RUNNING, LOADING, DONE }
+
+private data class TimerOutcome(val basis: String, val symbol: String, val gain: Double, val percent: Double)
+
+/** Sends the timer's start/end (epoch ms) to the backend, which works out the stock gain/loss */
+private fun fetchTimerOutcome(startMs: Long, endMs: Long): TimerOutcome {
+    val json = getJson("/api/timer-result?start=$startMs&end=$endMs")
+    return TimerOutcome(
+        json.getString("basis"),
+        json.getString("symbol"),
+        json.getDouble("gain"),
+        json.getDouble("percent")
+    )
+}
+
+private val PICKER_ROW_HEIGHT = 44.dp
+
+/** One scrollable column of two-digit numbers 00..(count-1)
+ *  Shows three rows; the middle one (inside the highlight band) is the selected value. */
+@Composable
+private fun NumberPicker(
+    label: String,
+    count: Int,
+    value: Int,
+    onValueChange: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val rowPx = with(LocalDensity.current) { PICKER_ROW_HEIGHT.toPx() }
+    // The list is [blank, 0, 1, ..., count-1, blank], so with 3 visible rows the value in the
+    // middle row is simply the index of the first (top) visible item.
+    val state = rememberLazyListState(initialFirstVisibleItemIndex = value)
+
+    // Whenever scrolling stops, snap to the nearest row and report it
+    LaunchedEffect(state) {
+        snapshotFlow { state.isScrollInProgress }
+            .filter { !it }
+            .collect {
+                val nearest = state.firstVisibleItemIndex +
+                    if (state.firstVisibleItemScrollOffset > rowPx / 2) 1 else 0
+                val row = nearest.coerceIn(0, count - 1)
+                onValueChange(row)
+                try {
+                    state.animateScrollToItem(row)
+                } catch (e: CancellationException) {
+                    ensureActive() // only swallow it if the user grabbed the list mid-snap
+                }
+            }
+    }
+
+    Column(modifier = modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, style = MaterialTheme.typography.labelLarge)
+        Box(
+            modifier = Modifier.height(PICKER_ROW_HEIGHT * 3),
+            contentAlignment = Alignment.Center
+        ) {
+            // Highlight band behind the selected (middle) row
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(PICKER_ROW_HEIGHT)
+                    .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+            )
+            LazyColumn(state = state, modifier = Modifier.fillMaxWidth()) {
+                item { Spacer(Modifier.height(PICKER_ROW_HEIGHT)) }
+                items(count) { i ->
+                    Box(
+                        Modifier.fillMaxWidth().height(PICKER_ROW_HEIGHT),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("%02d".format(i), style = MaterialTheme.typography.headlineSmall)
+                    }
+                }
+                item { Spacer(Modifier.height(PICKER_ROW_HEIGHT)) }
+            }
+        }
+    }
+}
+
 @Composable
 fun TimerScreen() {
-    return // TODO: complete
+    var hours by remember { mutableStateOf(0) }
+    var minutes by remember { mutableStateOf(0) }
+    var seconds by remember { mutableStateOf(0) }
+    var phase by remember { mutableStateOf(TimerPhase.IDLE) }
+    var startedAt by remember { mutableStateOf(0L) } // epoch ms, recorded when Start is pressed
+    var durationMs by remember { mutableStateOf(0L) }
+    var remainingMs by remember { mutableStateOf(0L) }
+    var outcome by remember { mutableStateOf<TimerOutcome?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    val inputMs = ((hours * 60L + minutes) * 60 + seconds) * 1_000
+
+    // Runs once per Start press (startedAt changes). Only the frontend tracks the countdown;
+    // the backend is contacted once, at the end, with the two recorded timestamps.
+    LaunchedEffect(startedAt) {
+        if (phase != TimerPhase.RUNNING) return@LaunchedEffect
+        val target = startedAt + durationMs
+
+        // Recompute from the wall clock every tick so a delayed tick can't make the timer drift
+        while (true) {
+            remainingMs = target - System.currentTimeMillis()
+            if (remainingMs <= 0) break
+            delay(200)
+        }
+
+        val endedAt = System.currentTimeMillis()
+        phase = TimerPhase.LOADING
+        try {
+            outcome = withContext(Dispatchers.IO) { fetchTimerOutcome(startedAt, endedAt) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = "Couldn't load stock results: ${e.message}"
+        }
+        phase = TimerPhase.DONE
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        when (phase) {
+            TimerPhase.IDLE -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    NumberPicker("hours", 24, hours, { hours = it }, Modifier.weight(1f))
+                    NumberPicker("min", 60, minutes, { minutes = it }, Modifier.weight(1f))
+                    NumberPicker("sec", 60, seconds, { seconds = it }, Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    enabled = inputMs > 0,
+                    onClick = {
+                        durationMs = inputMs
+                        remainingMs = inputMs
+                        outcome = null
+                        error = null
+                        startedAt = System.currentTimeMillis()
+                        phase = TimerPhase.RUNNING
+                    }
+                ) { Text("Start timer") }
+            }
+
+            TimerPhase.RUNNING -> {
+                val totalSec = (remainingMs + 999) / 1000 // round up so it never shows 00:00 early
+                val h = totalSec / 3600
+                val m = totalSec % 3600 / 60
+                val s = totalSec % 60
+                Text(
+                    if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s),
+                    style = MaterialTheme.typography.displayLarge
+                )
+            }
+
+            TimerPhase.LOADING -> Text("Time's up! Checking what \$1M would have done...")
+
+            TimerPhase.DONE -> {
+                val result = outcome
+                if (result == null) {
+                    Text(error ?: "Something went wrong")
+                } else {
+                    Text("Time's up! If you had put \$1M into ${result.symbol}:")
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "${"%+,.2f".format(result.gain)} USD (${"%+.2f".format(result.percent)}%)",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (result.gain >= 0) Color(0xFF2E7D32) else Color(0xFFC62828)
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(result.basis)
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(onClick = { phase = TimerPhase.IDLE }) { Text("New timer") }
+            }
+        }
+    }
 }
 
 //@Composable
