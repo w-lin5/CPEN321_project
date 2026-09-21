@@ -10,8 +10,6 @@ const DEVELOPER_NAME = {
   lastName: 'Lin',
 };
 
-const SERVER_PUBLIC_IP = '32.189.46.13';
-
 // Helper function to format number as a two-digit string
 // Used exclusively in formatGmtTime
 const pad = (n: number): string => String(n).padStart(2, '0');
@@ -29,6 +27,17 @@ export function formatGmtTime(date: Date = new Date()): string {
   )
 }
 
+export async function getServerPublicIp(): Promise<string> {
+  const response = await fetch("https://api.ipify.org?format=json");
+
+  if (!response.ok) {
+    throw new Error(`Failed to get public IP: ${response.status}`);
+  }
+
+  const data = await response.json() as { ip: string };
+  
+  return data.ip;
+}
 
 // Stock surprise (button 3 functionality)
 const STOCK_SYMBOL = 'AAPL';
@@ -109,8 +118,9 @@ async function computeTimerResult(startMs: number, endMs: number): Promise<Timer
 // API routes
 const apiRouter = Router();
 
-apiRouter.get('/server-ip', (_req, res) => {
-  res.json({ ip: SERVER_PUBLIC_IP });
+apiRouter.get('/server-ip', async (_req, res) => {
+  const ip = await getServerPublicIp()
+  res.json({ ip });
 })
 
 apiRouter.get('/server-time', (_req, res) => {
